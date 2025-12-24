@@ -66,13 +66,14 @@ def _print_table(findings: Iterable[Finding]) -> None:
         print("No SQL injection risks detected.")
         return
     file_width = max(len(Path(f.file).as_posix()) for f in findings)
-    header = f"{'File'.ljust(file_width)}  Line  Rule    Message"
+    header = f"{'File'.ljust(file_width)}  Line  Rule  Sev  Message"
     print(header)
     print("-" * len(header))
     for finding in findings:
         file_name = Path(finding.file).as_posix().ljust(file_width)
         line = str(finding.line).rjust(4)
-        print(f"{file_name}  {line}  {finding.rule_id:<6}  {finding.message}")
+        severity = finding.severity[:4].ljust(4)
+        print(f"{file_name}  {line}  {finding.rule_id:<6}  {severity} {finding.message}")
         print(f"    {finding.code}")
 
 

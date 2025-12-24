@@ -36,3 +36,39 @@ def test_allows_parameterized_query():
     """
     findings = scan_source(source)
     assert findings == []
+
+
+def test_sanitized_input_downgrades_severity():
+    source = """
+    import java.sql.Statement;
+    import javax.servlet.http.HttpServletRequest;
+    import org.apache.commons.text.StringEscapeUtils;
+
+    public class Demo {
+        public void run(HttpServletRequest request, Statement stmt) throws Exception {
+            String escaped = StringEscapeUtils.escapeSql(request.getParameter("name"));
+            String sql = "SELECT * FROM users WHERE name = '" + escaped + "'";
+            stmt.execute(sql);
+        }
+    }
+    """
+    findings = scan_source(source)
+    assert any(f.rule_id == "SQL001" and f.severity == "low" for f in findings)
+    assert any(f.rule_id == "SQL002" and f.severity == "medium" for f in findings)
+
+
+def test_prepared_statement_concatenation_detected():
+    source = """
+    import java.sql.Connection;
+    import javax.servlet.http.HttpServletRequest;
+
+    public class Demo {
+        public void run(HttpServletRequest request, Connection conn) throws Exception {
+            String table = request.getParameter("table");
+            String sql = "SELECT * FROM " + table + " WHERE id = ?";
+            conn.prepareStatement(sql);
+        }
+    }
+    """
+    findings = scan_source(source)
+    assert any(f.rule_id == "SQL003" for f in findings)

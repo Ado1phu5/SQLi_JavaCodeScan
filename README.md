@@ -6,7 +6,8 @@ A lightweight, efficient, and verifiable static analysis helper that highlights 
 
 - Detects SQL strings built with string concatenation, `String.format`, or tainted `StringBuilder` chains.
 - Tracks a small data-flow set of common request/input sources to reduce noise.
-- Flags execution sites (`Statement.execute*`) that reference unsafe query variables.
+- Flags execution sites (`Statement.execute*`) and prepared statements that reference unsafe query variables.
+- Severity column (high/medium/low) plus sanitizer awareness helps prioritize fixes.
 - CLI offers human-readable tables or JSON for tooling integration.
 - Comes with pytest coverage for the most critical behaviors so you can verify logic changes quickly.
 
@@ -34,6 +35,27 @@ Fail builds when any findings are present:
 
 ```bash
 sqliaudit src/ --fail-on-findings
+```
+
+## Verification Samples
+
+The `samples/` directory contains ready-to-scan Java snippets that exercise the detector:
+
+- `samples/vulnerable/ClassicConcat.java` – classic string concatenation detected as `SQL001/SQL002 (high)`.
+- `samples/vulnerable/UnsafePrepared.java` – misuse of `prepareStatement` triggers `SQL003`.
+- `samples/safe/SanitizedQuery.java` – escaping lowers severity to `low`.
+- `samples/safe/Parameterized.java` – proper prepared statement produces zero findings.
+
+Run the scanner over the vulnerable set:
+
+```bash
+sqliaudit samples/vulnerable
+```
+
+And compare with the safe set:
+
+```bash
+sqliaudit samples/safe
 ```
 
 ## Development

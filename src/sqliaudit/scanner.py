@@ -28,6 +28,16 @@ EXECUTION_PATTERNS = (
     "executeLargeUpdate",
     "executeBatch",
 )
+PREPARATION_PATTERNS = (
+    "prepareStatement",
+    "prepareCall",
+)
+SANITIZER_PATTERNS = [
+    re.compile(r"StringEscapeUtils\.escapeSql"),
+    re.compile(r"ESAPI\.encoder\(\)\.encodeForSQL"),
+    re.compile(r"sanitizeSql"),
+    re.compile(r"SqlUtils\.escape"),
+]
 
 IDENTIFIER_RE = re.compile(r"\b[_$A-Za-z][_$0-9A-Za-z]*\b")
 STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
@@ -42,6 +52,7 @@ class Finding:
     rule_id: str
     message: str
     code: str
+    severity: str
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +61,7 @@ class Finding:
             "rule_id": self.rule_id,
             "message": self.message,
             "code": self.code.strip(),
+            "severity": self.severity,
         }
 
 
@@ -60,11 +72,15 @@ class JavaSQLScanner:
         self._tainted_vars: set[str] = set()
         self._tainted_builders: set[str] = set()
         self._dangerous_queries: set[str] = set()
+        self._sanitized_vars: set[str] = set()
+        self._sanitized_queries: set[str] = set()
 
     def scan_file(self, path: Path) -> List[Finding]:
         self._tainted_vars.clear()
         self._tainted_builders.clear()
         self._dangerous_queries.clear()
+        self._sanitized_vars.clear()
+        self._sanitized_queries.clear()
         findings: List[Finding] = []
 
         try:
@@ -86,6 +102,7 @@ class JavaSQLScanner:
             if SQL_PATTERN.search(line):
                 findings.extend(self._detect_sql_issues(path, line_no, normalized))
 
+            findings.extend(self._detect_preparation_issues(path, line_no, normalized))
             findings.extend(self._detect_execution_issues(path, line_no, normalized))
 
         return findings
@@ -97,6 +114,7 @@ class JavaSQLScanner:
         target = _lhs_identifier(line)
         if target:
             self._tainted_vars.add(target)
+            self._sanitized_vars.discard(target)
 
     def _track_assignments(self, line: str) -> None:
         assignment = _lhs_identifier(line)
@@ -107,14 +125,36 @@ class JavaSQLScanner:
             return
 
         rhs_identifiers = set(IDENTIFIER_RE.findall(rhs))
+        sanitized_flag = _is_sanitized(rhs) or (
+            rhs_identifiers
+            and rhs_identifiers & self._sanitized_vars
+            and not rhs_identifiers & self._tainted_vars
+        )
+
+        if sanitized_flag:
+            self._sanitized_vars.add(assignment)
+            self._tainted_vars.discard(assignment)
+        else:
+            self._sanitized_vars.discard(assignment)
+            self._sanitized_queries.discard(assignment)
+
         if rhs_identifiers & self._tainted_vars:
             self._tainted_vars.add(assignment)
+        elif assignment in self._tainted_vars and not sanitized_flag:
+            self._tainted_vars.discard(assignment)
+
         if rhs_identifiers & self._dangerous_queries:
             self._dangerous_queries.add(assignment)
+            if rhs_identifiers & self._sanitized_queries and not rhs_identifiers & self._tainted_vars:
+                self._sanitized_queries.add(assignment)
 
         if _contains_sql_string(rhs):
-            if "+" in rhs or self._tainted_vars & rhs_identifiers:
+            if "+" in rhs or self._tainted_vars & rhs_identifiers or rhs_identifiers & self._dangerous_queries:
                 self._dangerous_queries.add(assignment)
+                if sanitized_flag:
+                    self._sanitized_queries.add(assignment)
+                else:
+                    self._sanitized_queries.discard(assignment)
 
     def _track_builders(self, line: str) -> None:
         builder_match = re.search(r"StringBuilder\s+(\w+)", line)
@@ -128,6 +168,11 @@ class JavaSQLScanner:
                 "+" in arg or any(var in self._tainted_vars for var in IDENTIFIER_RE.findall(arg))
             ):
                 self._dangerous_queries.add(name)
+                arg_identifiers = set(IDENTIFIER_RE.findall(arg))
+                if arg_identifiers & self._sanitized_vars and not arg_identifiers & self._tainted_vars:
+                    self._sanitized_queries.add(name)
+                else:
+                    self._sanitized_queries.discard(name)
 
     def _detect_sql_issues(self, path: Path, line_no: int, line: str) -> List[Finding]:
         findings: List[Finding] = []
@@ -141,6 +186,10 @@ class JavaSQLScanner:
         if _is_safe_parameterized(line):
             return findings
 
+        severity = "medium"
+        if self._uses_sanitization(line):
+            severity = "low"
+
         findings.append(
             Finding(
                 file=path,
@@ -148,6 +197,7 @@ class JavaSQLScanner:
                 rule_id="SQL001",
                 message="SQL string built with dynamic input",
                 code=line.strip(),
+                severity=severity,
             )
         )
         return findings
@@ -173,6 +223,10 @@ class JavaSQLScanner:
         if not suspicious:
             return findings
 
+        severity = "high"
+        if self._uses_sanitization(query_arg) or rhs_identifiers & self._sanitized_queries:
+            severity = "medium"
+
         findings.append(
             Finding(
                 file=path,
@@ -180,9 +234,56 @@ class JavaSQLScanner:
                 rule_id="SQL002",
                 message="Executing SQL built from user-influenced data",
                 code=line.strip(),
+                severity=severity,
             )
         )
         return findings
+
+    def _detect_preparation_issues(self, path: Path, line_no: int, line: str) -> List[Finding]:
+        findings: List[Finding] = []
+        if not any(f".{call}(" in line for call in PREPARATION_PATTERNS):
+            return findings
+
+        query_arg = _extract_first_argument(line)
+        if not query_arg:
+            return findings
+
+        rhs_identifiers = set(IDENTIFIER_RE.findall(query_arg))
+        suspicious = False
+
+        if rhs_identifiers & self._dangerous_queries:
+            suspicious = True
+        elif rhs_identifiers & self._tainted_vars:
+            suspicious = True
+        elif "+" in query_arg and _contains_sql_string(query_arg):
+            suspicious = True
+
+        if not suspicious:
+            return findings
+
+        severity = "medium"
+        if self._uses_sanitization(query_arg) or rhs_identifiers & self._sanitized_queries:
+            severity = "low"
+
+        findings.append(
+            Finding(
+                file=path,
+                line=line_no,
+                rule_id="SQL003",
+                message="Prepared/Callable statement built from user data",
+                code=line.strip(),
+                severity=severity,
+            )
+        )
+        return findings
+
+    def _uses_sanitization(self, text: str) -> bool:
+        if _is_sanitized(text):
+            return True
+        for symbol in self._sanitized_vars | self._sanitized_queries:
+            if _contains_symbol(text, symbol):
+                return True
+        return False
 
 
 def scan_path(path: Path | str) -> List[Finding]:
@@ -207,21 +308,20 @@ def scan_source(source: str, path: str = "Sample.java") -> List[Finding]:
 
     tmp_path = Path(path)
     scanner = JavaSQLScanner()
-    scanner._tainted_vars.clear()
-    scanner._tainted_builders.clear()
-    scanner._dangerous_queries.clear()
     findings: List[Finding] = []
     in_block_comment = False
     for idx, raw in enumerate(source.splitlines(), start=1):
         line, in_block_comment = _strip_comments(raw, in_block_comment)
         if not line.strip():
             continue
-        scanner._record_sources(line)
-        scanner._track_assignments(line)
-        scanner._track_builders(line)
+        stmt = line.strip()
+        scanner._record_sources(stmt)
+        scanner._track_assignments(stmt)
+        scanner._track_builders(stmt)
         if SQL_PATTERN.search(line):
-            findings.extend(scanner._detect_sql_issues(tmp_path, idx, line))
-        findings.extend(scanner._detect_execution_issues(tmp_path, idx, line))
+            findings.extend(scanner._detect_sql_issues(tmp_path, idx, stmt))
+        findings.extend(scanner._detect_preparation_issues(tmp_path, idx, stmt))
+        findings.extend(scanner._detect_execution_issues(tmp_path, idx, stmt))
     return findings
 
 
@@ -288,3 +388,11 @@ def _extract_first_argument(line: str) -> str | None:
     if not arg_chars:
         return None
     return "".join(arg_chars).strip()
+
+
+def _is_sanitized(expr: str) -> bool:
+    return any(pattern.search(expr) for pattern in SANITIZER_PATTERNS)
+
+
+def _contains_symbol(text: str, symbol: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(symbol)}\b", text))
