@@ -1,0 +1,5 @@
+# Install sqliaudit and its Python dependencies
+-e .
+
+# Test/development tooling
+pytest>=7.0

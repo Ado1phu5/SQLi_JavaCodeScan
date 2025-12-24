@@ -16,8 +16,10 @@ A lightweight, efficient, and verifiable static analysis helper that highlights 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -r requirements.txt
 ```
+
+The requirements file installs the package in editable mode and bundles pytest so CLI entry points and tests stay in sync with the source tree.
 
 Then run a scan (defaults to the current directory):
 
